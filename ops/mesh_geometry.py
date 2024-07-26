@@ -498,13 +498,13 @@ class arctan_det_occp(nn.Module):
         return torch.cat(occp).view(-1)
 
 
-def occupancy(mesh: Meshes, pt_target : torch.Tensor, allow_grad: bool = True):
+def occupancy(mesh: Meshes, pt_target : torch.Tensor, allow_grad: bool = True, max_query_point_batch_size=2000):
     arctan_occp = arctan_det_occp(mesh, allow_grad)
-    occp = arctan_occp(pt_target)
+    occp = arctan_occp(pt_target,max_query_point_batch_size)
     return occp
 
-def signed_distance_field(mesh: Meshes, pt_target : torch.Tensor, allow_grad: bool = True):
-    occp = occupancy(mesh, pt_target, allow_grad)
+def signed_distance_field(mesh: Meshes, pt_target : torch.Tensor, allow_grad: bool = True, max_query_point_batch_size=2000):
+    occp = occupancy(mesh, pt_target, allow_grad, max_query_point_batch_size)
     device = mesh.device
     n_points = pt_target.shape[0]
     dist, _ = _C.point_face_dist_forward(pt_target.view(-1, 3).to(device),
