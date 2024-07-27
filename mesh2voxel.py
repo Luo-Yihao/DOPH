@@ -1,4 +1,3 @@
-# %%
 import os
 import sys
 
@@ -73,7 +72,7 @@ def mesh2voxel(mesh, voxel_size=256, spacial_range=1.0, mode='occp', device_ids=
         #sdf_result = signed_distance_field(mesh_tem, coordinates_downsampled, allow_grad=False)
         occp_result = occupancy(mesh_tem, centroids, allow_grad=False)
 
-    non_closed_index = torch.where((occp_result- torch.round(occp_result)).abs() > 1e-3)[0]
+    non_closed_index = torch.where((occp_result- torch.round(occp_result)).abs() > 1e-5)[0]
 
     ## duplicate & flip the non-closed faces 
 
@@ -86,7 +85,7 @@ def mesh2voxel(mesh, voxel_size=256, spacial_range=1.0, mode='occp', device_ids=
     # new_mesh = Meshes(verts=[mesh_verts_new], faces=[face_new])
 
     # merge the old and new mesh
-    new_mesh = Meshes(verts=[mesh_tem.verts_packed(), mesh_verts_new], faces=[mesh_tem.faces_packed(), faces_new])
+    new_mesh = Meshes(verts=[ mesh_verts_new], faces=[ faces_new])
 
     # voxelizer = Differentiable_Voxelizer(bbox_density=128)
 
@@ -108,7 +107,8 @@ def mesh2voxel(mesh, voxel_size=256, spacial_range=1.0, mode='occp', device_ids=
         # %%
         with torch.no_grad():
             #sdf_result = signed_distance_field(mesh_tem, coordinates_downsampled, allow_grad=False)
-            occp_result = occupancy(new_mesh, coordinates_downsampled, allow_grad=False, max_query_point_batch_size=max_query_point_batch_size)
+            occp_result_ori = occupancy(mesh_tem, coordinates_downsampled, allow_grad=False, max_query_point_batch_size=max_query_point_batch_size)
+            occp_result_inverse = occupancy(new_mesh, coordinates_downsampled, allow_grad=False, max_query_point_batch_size=max_query_point_batch_size)
 
     else:
         ## Multi-GPUs Accelerating
@@ -144,7 +144,7 @@ def mesh2voxel(mesh, voxel_size=256, spacial_range=1.0, mode='occp', device_ids=
                 occp_result[indx] = occp
 
 
-
+    occp_result = torch.where((occp_result_ori - occp_result_ori.round()).abs() > 1e-5, occp_result_inverse+occp_result_ori, occp_result_ori)
     occpfield = occp_result.view(1, voxel_size, voxel_size, voxel_size)
     occpfield = occpfield.permute(0, 3, 2, 1)
 
