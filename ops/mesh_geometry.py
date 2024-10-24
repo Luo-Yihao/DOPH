@@ -5,12 +5,26 @@ import torch.nn.functional as F
 from torch_scatter import scatter
 
 from pytorch3d.structures import Meshes
-from pytorch3d.ops import mesh_face_areas_normals
+from pytorch3d.ops import mesh_face_areas_normals, packed_to_padded
 from einops import rearrange, einsum, repeat
 
 import numpy as np
 
 from pytorch3d import _C
+
+def get_faces_coordinates_padded(meshes: Meshes):
+    """
+    Get the faces coordinates of the meshes in padded format.
+    return:
+        face_coord_padded: [B, F, 3, 3]
+        
+    """
+    face_mesh_first_idx = meshes.mesh_to_faces_packed_first_idx()
+    face_coord_packed = meshes.verts_packed()[meshes.faces_packed(),:]
+
+    face_coord_padded = packed_to_padded(face_coord_packed, face_mesh_first_idx, max_size=meshes.faces_padded().shape[1])
+
+    return face_coord_padded
 
 def faces_angle(meshs: Meshes)->torch.Tensor:
     """
@@ -447,60 +461,74 @@ def normalize_mesh(mesh, rescalar=1.1):
 
 
 
-class arctan_det_occp(nn.Module):
+class SolidAngleOccp(nn.Module):
 
     def __init__(self, mesh_src: Meshes, allow_grad=True):
-        super(arctan_det_occp, self).__init__()
-        self.face_coord = mesh_src.verts_packed()[mesh_src.faces_packed(),:]
+        super(SolidAngleOccp, self).__init__()
+        self.face_coord = get_faces_coordinates_padded(mesh_src) # [B, F, 3, 3]
         if allow_grad:
             self.face_coord = nn.Parameter(self.face_coord)
         else:
             self.face_coord = nn.Parameter(self.face_coord, requires_grad=False)
 
 
-    def forward(self, query_points: torch.Tensor, max_query_point_batch_size=2000):
+    def forward(self, query_points: torch.Tensor, max_query_point_batch_size=10000, max_face_batch_size=1000):
         """
         Compute the occupancy of the query point relative to the mesh
         Args:
-            query_points: Tensor of shape (N,3) where N is the number of query points
+            query_points: Tensor of shape (N,3) or (B, N, 3) where N is the number of query points
+            max_query_point_batch_size: int, the maximum batch size for query points
         Returns:
-            occupancy: Tensor of shape (N,)
+            occupancy: Tensor of shape (B, N)
         """
+
+        if len(query_points.shape) == 2:
+            query_points = query_points.unsqueeze(0) # [1, N, 3]
+        else:
+            assert len(query_points.shape) == 3
+            assert query_points.shape[0] == self.face_coord.shape[0] # [B, N, 3]
 
         occp = []
 
+        for term in range(0, query_points.shape[-2], max_query_point_batch_size):
 
-        for i in range(0, query_points.shape[0], max_query_point_batch_size):
+            points = query_points[...,term:term+max_query_point_batch_size,:]
 
-            points = query_points[i:i+max_query_point_batch_size]
+            occp_term = torch.zeros(points.shape[0], points.shape[1]).to(points.device)
 
-            face_vect = self.face_coord.unsqueeze(0).repeat(points.shape[0],1,1,1) - points.unsqueeze(1).unsqueeze(1)
+            for face_term in range(0, self.face_coord.shape[1], max_face_batch_size):
 
-            
-            a_vert = face_vect[:,:,0,:]
-            b_vert = face_vect[:,:,1,:]
-            c_vert = face_vect[:,:,2,:]
+                face_coord = self.face_coord[:,face_term:face_term+max_face_batch_size,:,:]
 
-            face_det = (a_vert * b_vert.cross(c_vert)).sum(dim=-1)
+                face_vect = face_coord.unsqueeze(1).repeat(1,points.shape[0],1,1,1) - points.unsqueeze(2).unsqueeze(2)
 
-            abc = face_vect.norm(dim=-1).prod(dim=-1)
+                a_vert = face_vect[:,:,:,0,:] # [B, N, F, 3]        
+                b_vert = face_vect[:,:,:,1,:] # [B, N, F, 3]
+                c_vert = face_vect[:,:,:,2,:] # [B, N, F, 3]
 
-            ab = (a_vert*b_vert).sum(-1)
-            bc = (b_vert*c_vert).sum(-1)
-            ac = (a_vert*c_vert).sum(-1)
+                face_det = (a_vert * b_vert.cross(c_vert)).sum(dim=-1) # [B, N, F]
 
-            # face_det_inv = (abc + bc*a_vert.norm(dim=-1) + ac*b_vert.norm(dim=-1) + ab*c_vert.norm(dim=-1))/(face_det+1e-8)
+                abc = face_vect.norm(dim=-1).prod(dim=-1) # [B, N, F]
 
-            solid_angle = torch.arctan2(face_det, (abc + bc*a_vert.norm(dim=-1) + ac*b_vert.norm(dim=-1) + ab*c_vert.norm(dim=-1)))*2
+                ab = (a_vert*b_vert).sum(-1) # [B, N, F]
+                bc = (b_vert*c_vert).sum(-1) # [B, N, F]
+                ac = (a_vert*c_vert).sum(-1) # [B, N, F]
 
-            occp.append(solid_angle.sum(-1)/np.pi/4)
+                solid_angle_2 = torch.arctan2(face_det, (abc + bc*a_vert.norm(dim=-1) + ac*b_vert.norm(dim=-1) + ab*c_vert.norm(dim=-1))) # [B, N, F]
 
-        return torch.cat(occp).view(-1)
+                occp_term += solid_angle_2.sum(-1) # solid_angle/pi/4
+                
+            occp.append(occp_term/np.pi/2)
 
+        return torch.cat(occp, dim=-1)
 
-def occupancy(mesh: Meshes, pt_target : torch.Tensor, allow_grad: bool = True, max_query_point_batch_size=2000):
-    arctan_occp = arctan_det_occp(mesh, allow_grad)
-    occp = arctan_occp(pt_target,max_query_point_batch_size)
+def occupancy(mesh: Meshes, pt_target : torch.Tensor, allow_grad: bool = False, max_query_point_batch_size=2000, max_face_batch_size=10000):
+    solid_angle_occp = SolidAngleOccp(mesh, allow_grad)
+    if allow_grad:
+        occp = solid_angle_occp(pt_target, max_query_point_batch_size, max_face_batch_size)
+    else:
+        with torch.no_grad():
+            occp = solid_angle_occp(pt_target, max_query_point_batch_size, max_face_batch_size)
     return occp
 
 def signed_distance_field(mesh: Meshes, pt_target : torch.Tensor, allow_grad: bool = True, max_query_point_batch_size=2000):
