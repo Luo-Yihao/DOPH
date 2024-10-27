@@ -483,7 +483,7 @@ class SolidAngleOccp(nn.Module):
         """
 
         if len(query_points.shape) == 2:
-            query_points = query_points.unsqueeze(0) # [1, N, 3]
+            query_points = query_points.unsqueeze(0).repeat(self.face_coord.shape[0],1,1)# [B, N, 3]
         else:
             assert len(query_points.shape) == 3
             assert query_points.shape[0] == self.face_coord.shape[0] # [B, N, 3]
@@ -500,7 +500,8 @@ class SolidAngleOccp(nn.Module):
 
                 face_coord = self.face_coord[:,face_term:face_term+max_face_batch_size,:,:]
 
-                face_vect = face_coord.unsqueeze(1).repeat(1,points.shape[0],1,1,1) - points.unsqueeze(2).unsqueeze(2)
+                # face_vect = face_coord.unsqueeze(1).repeat(1,points.shape[-2],1,1,1) - points.unsqueeze(2).unsqueeze(2)
+                face_vect = face_coord.unsqueeze(1).repeat(1,points.shape[-2],1,1,1) - points.unsqueeze(2).unsqueeze(2).repeat(1,1,face_coord.shape[-3],3,1)
 
                 a_vert = face_vect[:,:,:,0,:] # [B, N, F, 3]        
                 b_vert = face_vect[:,:,:,1,:] # [B, N, F, 3]

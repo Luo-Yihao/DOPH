@@ -112,7 +112,7 @@ def mesh2voxel(mesh, voxel_size=256, spacial_range=1.0, mode='occp', device_ids=
 
     else:
         ## Multi-GPUs Accelerating
-        arctan_occp = arctan_det_occp(mesh_tem)
+        arctan_occp = SolidAngleOccp(mesh_tem)
 
         # if u wanna use multi-gpus (but may not be faster)
 
@@ -210,6 +210,7 @@ if __name__ == '__main__':
     trimesh_cubified.export('output/'+name+'/'+name+'_'+args.mode+'_%d.obj'%sample_size)
     mesh.export('output/'+name+'/'+name+'_ori.obj')
     torch.save(occpfield, 'output/'+name+'/'+name+'_'+args.mode+'_%d.pt'%sample_size)
+    print('Done! The output mesh is saved in '+args.output_path+'/'+name+'/'+name+'_'+args.mode+'_%d.obj'%sample_size)
 
 
 
