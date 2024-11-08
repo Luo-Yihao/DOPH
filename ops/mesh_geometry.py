@@ -449,11 +449,13 @@ class Differentiable_SDF(nn.Module):
 
 def normalize_mesh(mesh, rescalar=1.1):
     bbox = mesh.get_bounding_boxes()
+    B = bbox.shape[0]
     center = (bbox[:, :, 0] + bbox[:, :, 1]) / 2
-    center = center.unsqueeze(-2)
-    size = (bbox[:, :, 1] - bbox[:, :, 0]).max(dim=-1)[0]
-    
-    scale = 2.0 / (size*rescalar+1e-8).unsqueeze(-1).unsqueeze(-1)
+    center = center.view(B, 1, 3)
+    size = (bbox[:, :, 1] - bbox[:, :, 0]) 
+
+    scale = 2.0 / (torch.max(size, dim=-1)[0]*rescalar+1e-8)
+    scale = scale.view(B, 1, 1)
 
     mesh = mesh.update_padded((mesh.verts_padded()-center)*scale)
     return mesh
