@@ -2,11 +2,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from torch_scatter import scatter
+import trimesh
 
 from pytorch3d.structures import Meshes
 from pytorch3d.ops import mesh_face_areas_normals, packed_to_padded
 from einops import rearrange, einsum, repeat
+
+from torch_scatter import scatter
 
 import numpy as np
 
@@ -545,3 +547,161 @@ def signed_distance_field(mesh: Meshes, pt_target : torch.Tensor, allow_grad: bo
             n_points, 1e-6)
     sign = 2*(occp.view(-1)-0.5)
     return sign*dist
+
+
+class SolidAngleOccp_components(nn.Module):
+
+    def __init__(self, mesh_src: Meshes, allow_grad=False):
+        super(SolidAngleOccp_components, self).__init__()
+        self.face_coord = get_faces_coordinates_padded(mesh_src) # [B, F, 3, 3]
+        if allow_grad:
+            self.face_coord = nn.Parameter(self.face_coord)
+        else:
+            self.face_coord = nn.Parameter(self.face_coord, requires_grad=False)
+
+        self.face_first_index = mesh_src.mesh_to_faces_packed_first_idx()
+
+    
+    def forward(self, query_points: torch.Tensor, gather_label, max_query_point_batch_size=10000, max_face_batch_size=1000):
+        """
+        Compute the occupancy of the query point relative to the mesh
+        Args:
+            query_points: Tensor of shape (N,3) or (B, N, 3) where N is the number of query points
+            gather_label: Tensor of shape (B, ) where C is the number of components
+            max_query_point_batch_size: int, the maximum batch size for query points
+            
+            
+        Returns:
+            occupancy: Tensor of shape (B, N)
+        """
+        
+
+        if len(query_points.shape) == 2:
+            query_points = query_points.unsqueeze(0).repeat(self.face_coord.shape[0],1,1)# [B, N, 3]
+        else:
+            assert len(query_points.shape) == 3
+            assert query_points.shape[0] == self.face_coord.shape[0] # [B, N, 3]
+
+        if len(gather_label.shape) == 1:
+            assert gather_label.shape[0] == self.face_coord.shape[0]*self.face_coord.shape[1]
+            face_first_index = self.face_first_index
+            gather_label = packed_to_padded(gather_label.float(),
+                                            first_idxs=face_first_index, max_size=self.face_coord.shape[1])
+            gather_label = gather_label.long()
+        else:
+            assert len(gather_label.shape) == 2
+            assert gather_label.shape[0] == self.face_coord.shape[0]
+            assert gather_label.shape[1] == self.face_coord.shape[1]
+        
+        
+            
+
+
+        occp = []
+
+        for term in range(0, query_points.shape[-2], max_query_point_batch_size):
+
+            points = query_points[...,term:term+max_query_point_batch_size,:]
+
+            # occp_term = torch.zeros(points.shape[0], points.shape[1]).to(points.device)
+
+            occp_term = torch.zeros(points.shape[0], points.shape[1], gather_label.max()+1).to(points.device)
+
+
+            for face_term in range(0, self.face_coord.shape[1], max_face_batch_size):
+
+                face_coord = self.face_coord[:,face_term:face_term+max_face_batch_size,:,:]
+
+                gather_label_term = gather_label[:,face_term:face_term+max_face_batch_size]
+
+                gather_label_term = torch.where(gather_label_term == -1, 0, gather_label_term)
+
+                # face_vect = face_coord.unsqueeze(1).repeat(1,points.shape[-2],1,1,1) - points.unsqueeze(2).unsqueeze(2)
+                face_vect = face_coord.unsqueeze(1).repeat(1,points.shape[-2],1,1,1) - points.unsqueeze(2).unsqueeze(2).repeat(1,1,face_coord.shape[-3],3,1)
+
+                a_vert = face_vect[:,:,:,0,:] # [B, N, F, 3]        
+                b_vert = face_vect[:,:,:,1,:] # [B, N, F, 3]
+                c_vert = face_vect[:,:,:,2,:] # [B, N, F, 3]
+
+                face_det = (a_vert * b_vert.cross(c_vert)).sum(dim=-1) # [B, N, F]
+
+                abc = face_vect.norm(dim=-1).prod(dim=-1) # [B, N, F]
+
+                ab = (a_vert*b_vert).sum(-1) # [B, N, F]
+                bc = (b_vert*c_vert).sum(-1) # [B, N, F]
+                ac = (a_vert*c_vert).sum(-1) # [B, N, F]
+
+                solid_angle_2 = torch.arctan2(face_det, (abc + bc*a_vert.norm(dim=-1) + ac*b_vert.norm(dim=-1) + ab*c_vert.norm(dim=-1))) # [B, N, F]
+
+                solid_angle_2_sum = scatter(solid_angle_2.permute(0,2,1) , gather_label_term, dim=1, reduce='sum', dim_size=gather_label.max()+1) # [B, C, N]
+
+                solid_angle_2_sum = solid_angle_2_sum.permute(0,2,1) # [B, N, C]
+
+                # solid_angle_2_solfmin = F.softmin(10*(solid_angle_2_sum*2 - (2*solid_angle_2_sum).round())**2, dim=-1) # [B, N, C]
+
+                # occp_term += (solid_angle_2_sum * solid_angle_2_solfmin).sum(-1)
+
+                occp_term += solid_angle_2_sum
+                # solid_angle/pi/4
+                
+            occp.append(occp_term/np.pi/2)
+
+        return torch.cat(occp, dim=1)
+
+
+
+
+def flexible_occupancy(mesh: trimesh.Trimesh, pt_target : torch.Tensor, allow_grad: bool = False, max_query_point_batch_size=2000, max_face_batch_size=10000):
+
+    component_indx = trimesh.graph.connected_component_labels(mesh.face_adjacency)
+    component_indx = torch.from_numpy(component_indx).to(pt_target.device)
+
+    mesh_tem = Meshes(verts=[torch.from_numpy(mesh.vertices).float().to(pt_target.device)], 
+                        faces=[torch.from_numpy(mesh.faces).long().to(pt_target.device)])
+
+    solid_angle_occp = SolidAngleOccp_components(mesh_tem, allow_grad)
+
+
+    mesh_verts_new = mesh_tem.verts_padded().clone() - mesh_tem.verts_normals_padded()*1e-2
+
+
+    # faces_new = mesh_tem.faces_packed().clone()[non_closed_index,:]
+    faces_new = mesh_tem.faces_padded().clone()
+    faces_new = faces_new[:,:,[0,2,1]]
+
+
+    # new_mesh = Meshes(verts=[mesh_verts_new], faces=[face_new])
+
+    # merge the old and new mesh
+    B = mesh_tem.faces_padded().shape[0]
+    mesh_flipped = Meshes(verts=[mesh_verts_new[i] for i in range(B)], faces=[faces_new[i] for i in range(B)])
+
+    if allow_grad:
+        occp = solid_angle_occp(pt_target, max_face_batch_size = max_face_batch_size, 
+                                max_query_point_batch_size=max_query_point_batch_size, 
+                                gather_label=component_indx)
+        solid_angle_occp = SolidAngleOccp_components(mesh_flipped, allow_grad)
+        occp_flipped = solid_angle_occp(pt_target, max_face_batch_size = max_face_batch_size, 
+                                        max_query_point_batch_size=max_query_point_batch_size, 
+                                        gather_label=component_indx)
+    else:
+        with torch.no_grad():
+            occp = solid_angle_occp(pt_target, max_face_batch_size= max_face_batch_size, 
+                                    max_query_point_batch_size=max_query_point_batch_size, 
+                                    gather_label=component_indx)
+            solid_angle_occp = SolidAngleOccp_components(mesh_flipped, allow_grad)
+            occp_flipped = solid_angle_occp(pt_target, max_face_batch_size= max_face_batch_size, 
+                                            max_query_point_batch_size=max_query_point_batch_size, 
+                                            gather_label=component_indx)
+
+        B_indx, N_indx, C_indx = torch.where(((occp - occp.round()).abs()< 1e-2)*(occp.round().abs() > 0.5))
+
+        occp_result = torch.zeros_like(occp[...,0])
+
+        occp_result[B_indx, N_indx] = 1.0   
+
+        occp_result = torch.where(occp_result == 0, (occp_flipped+occp).sum(-1).abs(), occp_result)
+
+        occp_result = torch.sigmoid(10*(occp_result - 0.5))
+
+    return occp_result
