@@ -59,39 +59,45 @@ def mesh2voxel(mesh, voxel_size=256, spacial_range=1.0, mode='occp', device_ids=
     else:
         device = torch.device("cpu")
 
+    component_indx = trimesh.graph.connected_component_labels(trimesh_tem.face_adjacency)
+    component_indx = torch.from_numpy(component_indx).to(device)
+
+
     mesh_tem = Meshes(verts=[torch.from_numpy(trimesh_tem.vertices).float()], 
                     faces=[torch.from_numpy(trimesh_tem.faces).long()]).to(device)
 
-    # mesh_tem = normalize_mesh(mesh_tem) # normalize the mesh to fit in the unit cube 
+    mesh_tem = normalize_mesh(mesh_tem) # normalize the mesh to fit in the unit cube 
 
     #### Fipped duplication
-    ## non-closed mesh check
-    centroids = mesh_tem.verts_packed()[mesh_tem.faces_packed()].mean(-2)
-
-    with torch.no_grad():
-        #sdf_result = signed_distance_field(mesh_tem, coordinates_downsampled, allow_grad=False)
-        occp_result = occupancy(mesh_tem, centroids, allow_grad=False)
-
-    non_closed_index = torch.where((occp_result- torch.round(occp_result)).abs() > 1e-5)[0]
 
     ## duplicate & flip the non-closed faces 
 
-    mesh_verts_new = mesh_tem.verts_packed().clone() - mesh_tem.verts_normals_packed()*1e-2
+    
 
-    faces_new = mesh_tem.faces_packed().clone()[non_closed_index,:]
-
-    faces_new = faces_new[:,[0,2,1]]
 
     # new_mesh = Meshes(verts=[mesh_verts_new], faces=[face_new])
 
     # merge the old and new mesh
-    new_mesh = Meshes(verts=[ mesh_verts_new], faces=[ faces_new])
+    
 
     # voxelizer = Differentiable_Voxelizer(bbox_density=128)
 
     sample_size = voxel_size
 
     meshbbox = mesh_tem.get_bounding_boxes()[0]*spacial_range
+
+    
+
+    length = (meshbbox[:,1] - meshbbox[:,0]).max()
+
+    mesh_verts_new = mesh_tem.verts_packed().clone() - mesh_tem.verts_normals_packed()*1e-2*length/2
+
+    faces_new = mesh_tem.faces_packed().clone()
+
+    faces_new = faces_new[:,[0,2,1]]
+
+
+    new_mesh = Meshes(verts=[mesh_verts_new], faces=[ faces_new])
 
     coordinates_downsampled = torch.stack(torch.meshgrid(torch.linspace(meshbbox[0,0], meshbbox[0,1], sample_size),
                                                             torch.linspace(meshbbox[1,0], meshbbox[1,1], sample_size),
@@ -107,12 +113,17 @@ def mesh2voxel(mesh, voxel_size=256, spacial_range=1.0, mode='occp', device_ids=
         # %%
         with torch.no_grad():
             #sdf_result = signed_distance_field(mesh_tem, coordinates_downsampled, allow_grad=False)
-            occp_result_ori = occupancy(mesh_tem, coordinates_downsampled, allow_grad=False, max_query_point_batch_size=max_query_point_batch_size)
-            occp_result_inverse = occupancy(new_mesh, coordinates_downsampled, allow_grad=False, max_query_point_batch_size=max_query_point_batch_size)
+            # occp_result_ori = occupancy(mesh_tem, coordinates_downsampled, allow_grad=False, max_query_point_batch_size=max_query_point_batch_size)
+            # occp_result_inverse = occupancy(new_mesh, coordinates_downsampled, allow_grad=False, max_query_point_batch_size=max_query_point_batch_size)
+            occp_result = flexible_occupancy(mesh_tem, coordinates_downsampled, component_indx, allow_grad=False)
 
     else:
         ## Multi-GPUs Accelerating
-        arctan_occp = SolidAngleOccp(mesh_tem)
+
+
+        arctan_occp = SolidAngleOccp_components(mesh_tem)
+
+        arctan_occp_inverse = SolidAngleOccp_components(new_mesh)
 
         # if u wanna use multi-gpus (but may not be faster)
 
@@ -133,18 +144,32 @@ def mesh2voxel(mesh, voxel_size=256, spacial_range=1.0, mode='occp', device_ids=
 
         occp_result = torch.zeros(n_points, dtype=torch.half, device=output_gpu)
 
-        opp_result = occp_result.half()
+        occp_result = occp_result.half()
 
 
         for i, (data, idx) in enumerate(dataloader): ### multi-gpu
             points = data.cuda()
             indx = idx.to(output_gpu)
             with torch.no_grad():
-                occp = arctan_occp.forward(points, max_query_point_batch_size=max_query_point_batch_size)
+                occp = arctan_occp.forward(points, max_query_point_batch_size=max_query_point_batch_size, component_indx=component_indx)
+                
+                
+                occp_flipped = arctan_occp_inverse.forward(points, max_query_point_batch_size=max_query_point_batch_size, component_indx=component_indx)
+
+                B_indx, N_indx, C_indx = torch.where(((occp - occp.round()).abs()< 1e-3)*(occp.round().abs() > 0.5))
+
+                occp_result = torch.zeros_like(occp[...,0])
+
+                occp_result[B_indx, N_indx] = 1.0   
+
+                occp_result = torch.where(occp_result == 0, (occp_flipped+occp).sum(-1).abs(), occp_result)
+
+                occp_result = torch.sigmoid(10*(occp_result - 0.5))
+
                 occp_result[indx] = occp
 
 
-    occp_result = torch.where((occp_result_ori - occp_result_ori.round()).abs() > 1e-5, occp_result_inverse+occp_result_ori, occp_result_ori)
+    # occp_result = torch.where((occp_result_ori - occp_result_ori.round()).abs() > 1e-5, occp_result_inverse+occp_result_ori, occp_result_ori)
     occpfield = occp_result.view(1, voxel_size, voxel_size, voxel_size)
     occpfield = occpfield.permute(0, 3, 2, 1)
 
@@ -157,8 +182,6 @@ def mesh2voxel(mesh, voxel_size=256, spacial_range=1.0, mode='occp', device_ids=
                             mesh_tem.verts_packed()[mesh_tem.faces_packed(),:].to(device),
                             torch.tensor([0], device=device, dtype=torch.int64),
                             n_points, 1e-5)
-
-
 
     sdf = dist*(0.5-occp_result)
 
@@ -199,7 +222,7 @@ if __name__ == '__main__':
 
     import mcubes
     if args.mode == 'occp':
-        vertices, triangles = mcubes.marching_cubes((occpfield.permute(0, 3, 2, 1))[0].cpu().numpy(), 0.5)
+        vertices, triangles = mcubes.marching_cubes((occpfield.permute(0, 3, 2, 1))[0].cpu().numpy(), 0.4)
     elif args.mode == 'sdf':
         vertices, triangles = mcubes.marching_cubes(-(occpfield.permute(0, 3, 2, 1))[0].cpu().numpy(), 0.0)
 

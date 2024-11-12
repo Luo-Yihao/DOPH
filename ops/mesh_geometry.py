@@ -705,3 +705,69 @@ def flexible_occupancy(mesh: trimesh.Trimesh, pt_target : torch.Tensor, allow_gr
         occp_result = torch.sigmoid(10*(occp_result - 0.5))
 
     return occp_result
+
+
+
+
+def flexible_occupancy(mesh: Meshes, pt_target : torch.Tensor, 
+                       component_indx: torch.Tensor=None, allow_grad: bool = False, 
+                       max_query_point_batch_size=2000, 
+                       max_face_batch_size=10000):
+                        
+    if isinstance(mesh, trimesh.Trimesh):
+        component_indx = trimesh.graph.connected_component_labels(mesh.face_adjacency)
+        component_indx = torch.from_numpy(component_indx).to(pt_target.device)
+
+        mesh_tem = Meshes(verts=[torch.from_numpy(mesh.vertices).float().to(pt_target.device)],
+                            faces=[torch.from_numpy(mesh.faces).long().to(pt_target.device)])
+        
+    elif isinstance(mesh, Meshes):
+        assert component_indx is not None, "The component index should be provided when the input is Meshes"
+        component_indx = component_indx
+        mesh_tem = mesh
+
+    solid_angle_occp = SolidAngleOccp_components(mesh_tem, allow_grad)
+
+    mesh_verts_new = mesh_tem.verts_padded().clone() - mesh_tem.verts_normals_padded()*1e-2
+
+
+    # faces_new = mesh_tem.faces_packed().clone()[non_closed_index,:]
+    faces_new = mesh_tem.faces_padded().clone()
+    faces_new = faces_new[:,:,[0,2,1]]
+
+
+    # new_mesh = Meshes(verts=[mesh_verts_new], faces=[face_new])
+
+    # merge the old and new mesh
+    B = mesh_tem.faces_padded().shape[0]
+    mesh_flipped = Meshes(verts=[mesh_verts_new[i] for i in range(B)], faces=[faces_new[i] for i in range(B)])
+
+    if allow_grad:
+        occp = solid_angle_occp(pt_target, max_face_batch_size = max_face_batch_size, 
+                                max_query_point_batch_size=max_query_point_batch_size, 
+                                gather_label=component_indx)
+        solid_angle_occp = SolidAngleOccp_components(mesh_flipped, allow_grad)
+        occp_flipped = solid_angle_occp(pt_target, max_face_batch_size = max_face_batch_size, 
+                                        max_query_point_batch_size=max_query_point_batch_size, 
+                                        gather_label=component_indx)
+    else:
+        with torch.no_grad():
+            occp = solid_angle_occp(pt_target, max_face_batch_size= max_face_batch_size, 
+                                    max_query_point_batch_size=max_query_point_batch_size, 
+                                    gather_label=component_indx)
+            solid_angle_occp = SolidAngleOccp_components(mesh_flipped, allow_grad)
+            occp_flipped = solid_angle_occp(pt_target, max_face_batch_size= max_face_batch_size, 
+                                            max_query_point_batch_size=max_query_point_batch_size, 
+                                            gather_label=component_indx)
+
+        B_indx, N_indx, C_indx = torch.where(((occp - occp.round()).abs()< 1e-2)*(occp.round().abs() > 0.5))
+
+        occp_result = torch.zeros_like(occp[...,0])
+
+        occp_result[B_indx, N_indx] = 1.0   
+
+        occp_result = torch.where(occp_result == 0, (occp_flipped+occp).sum(-1).abs(), occp_result)
+
+        occp_result = torch.sigmoid(10*(occp_result - 0.5))
+
+    return occp_result
