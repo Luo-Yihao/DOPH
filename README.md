@@ -77,7 +77,8 @@ The `occupancy` function is adaptive to non-watertight (almost-closed) meshes. F
 
 ![Example of a mesh from ShapeNet](img/Dup.png)
 
-The differentiable voxelization and mesh morphing can be used for mesh reconstruction, which is extremely useful for 3D medical image processing. For more details, please refer to our  repository [GHDHeart](https://github.com/Luo-Yihao/GHDHeart), where we use the differentiable slicing to reconstruct the 3D heart from 2D scans. 
+The differentiable voxelization and mesh morphing can be used for mesh reconstruction, which is extremely useful for 3D medical image processing. For more details, please refer to our  repository [GHDHeart](https://github.com/Luo-Yihao/GHDHeart), where we use the differentiable slicing to reconstruct the 3D heart from 2D scans. Morphing results like the following can be obtained:
+<div align=center><img src="img/morphing.gif" width="50%" height="50%"></div>
 
 
 
