@@ -13,6 +13,42 @@ from torch_scatter import scatter
 import numpy as np
 
 from pytorch3d import _C
+from tqdm import tqdm
+
+
+def normalize_mesh(mesh, rescalar=0.99):
+    """
+    Normalize the mesh to fit in the unit sphere
+    Args:
+        mesh: Meshes object or trimesh object
+        rescalar: float, the scale factor to rescale the mesh
+    """
+    if isinstance(mesh, Meshes):
+       
+        bbox = mesh.get_bounding_boxes()
+        B = bbox.shape[0]
+        center = (bbox[:, :, 0] + bbox[:, :, 1]) / 2
+        center = center.view(B, 1, 3)
+        size = (bbox[:, :, 1] - bbox[:, :, 0]) 
+
+        scale = 2.0 / (torch.max(size, dim=1)[0]+1e-8).view(B, 1)*rescalar
+        scale = scale.view(B, 1, 1)
+        mesh = mesh.update_padded((mesh.verts_padded()-center)*scale)
+        return mesh
+
+    elif isinstance(mesh, trimesh.Trimesh):
+        bbox_min, bbox_max = mesh.bounds
+        bbox_center = (bbox_min + bbox_max) / 2
+        bbox_size = bbox_max - bbox_min
+
+        # Scale factor to normalize to [-1, 1]
+        scale_factor = 2.0 / np.max(bbox_size)  # Ensures the longest side fits in [-1, 1]
+
+        # Apply translation and scaling
+        mesh.apply_translation(-bbox_center)  # Move the mesh center to the origin
+        mesh.apply_scale(scale_factor)
+
+    return mesh
 
 def get_faces_coordinates_padded(meshes: Meshes):
     """
@@ -27,6 +63,7 @@ def get_faces_coordinates_padded(meshes: Meshes):
     face_coord_padded = packed_to_padded(face_coord_packed, face_mesh_first_idx, max_size=meshes.faces_padded().shape[1])
 
     return face_coord_padded
+
 
 def faces_angle(meshs: Meshes)->torch.Tensor:
     """
@@ -184,14 +221,13 @@ def Electric_strength(q, p):
 
 
 
-def Winding_Occupancy(mesh_tem: Meshes, points: torch.Tensor, max_v_per_call=2000):
+def winding_occupancy(mesh_tem: Meshes, points: torch.Tensor, max_v_per_call=2000):
     """
     Involving the winding number to evaluate the occupancy of the points relative to the mesh
     mesh_tem: the reference mesh
     points: the points to be evaluated Nx3
     """
     dual_areas = dual_area_vertex(mesh_tem)
-
 
     normals_areaic = mesh_tem.verts_normals_packed() * dual_areas.view(-1,1)
 
@@ -207,7 +243,7 @@ def Winding_Occupancy(mesh_tem: Meshes, points: torch.Tensor, max_v_per_call=200
     return winding_field
 
 
-def Winding_Occupancy_Face(mesh_tem: Meshes, points: torch.Tensor, max_f_per_call=2000):
+def winding_occupancy_face(mesh_tem: Meshes, points: torch.Tensor, max_f_per_call=2000):
     """
     Involving the winding number to evaluate the occupancy of the points relative to the mesh
     mesh_tem: the reference mesh
@@ -231,17 +267,14 @@ def Winding_Occupancy_Face(mesh_tem: Meshes, points: torch.Tensor, max_f_per_cal
     return winding_field
 
 
-
-
-
-class Differentiable_Voxelizer(nn.Module):
+class Differentiable_Grid_Voxelizer(nn.Module):
     def __init__(self, bbox_density=128, integrate_method='vertex'):
-        super(Differentiable_Voxelizer, self).__init__()
+        super(Differentiable_Grid_Voxelizer, self).__init__()
         self.bbox_density = bbox_density
         if integrate_method == 'face':
-            self.Winding_Occupancy = Winding_Occupancy_Face
+            self.winding_occupancy = winding_occupancy_face
         elif integrate_method == 'vertex':
-            self.Winding_Occupancy = Winding_Occupancy
+            self.winding_occupancy = winding_occupancy
 
     def forward(self, mesh_src: Meshes, output_resolution=256, max_v_per_call=2000, if_binary=False):
         """
@@ -286,10 +319,10 @@ class Differentiable_Voxelizer(nn.Module):
         for i in range(0, coordinates.shape[0]):
             tem_charge = coordinates[i]
 
-            occupency_temp = self.Winding_Occupancy(mesh_src, tem_charge, max_v_per_call=max_v_per_call)
+            occupency_temp = self.winding_occupancy(mesh_src, tem_charge, max_v_per_call=max_v_per_call)
 
             if if_binary:
-                occupency_temp = torch.sigmoid((self.Winding_Occupancy(mesh_src, tem_charge,max_v_per_call=max_v_per_call)-0.5)*100)
+                occupency_temp = torch.sigmoid((self.winding_occupancy(mesh_src, tem_charge,max_v_per_call=max_v_per_call)-0.5)*100)
 
             occupency_fields.append(occupency_temp)
 
@@ -343,9 +376,9 @@ def differentiable_sdf(mesh: Meshes, query_points: torch.Tensor, max_query_point
         dist = dist.view(-1, 1)
             
         if integrate_method == 'face':
-            occupancy = Winding_Occupancy_Face(mesh, points, max_f_per_call=2000).view(-1,1)
+            occupancy = winding_occupancy_face(mesh, points, max_f_per_call=2000).view(-1,1)
         else:
-            occupancy = Winding_Occupancy(mesh, points, max_v_per_call=2000).view(-1,1)
+            occupancy = winding_occupancy(mesh, points, max_v_per_call=2000).view(-1,1)
         # binary occupancy
         if binary_style == 'tanh':
             occupancy = -torch.tanh((occupancy-0.5)*1000) # [0,1] -> [-1,1]
@@ -365,14 +398,14 @@ def differentiable_sdf(mesh: Meshes, query_points: torch.Tensor, max_query_point
         
 
     
-class Differentiable_SDF(nn.Module):
+class Differentiable_Grid_SDF(nn.Module):
     def __init__(self, bbox_density=128, integrate_method='face'):
-        super(Differentiable_Voxelizer, self).__init__()
+        super(Differentiable_Grid_SDF, self).__init__()
         self.bbox_density = bbox_density
         if integrate_method == 'face':
-            self.Winding_Occupancy = Winding_Occupancy_Face
+            self.winding_occupancy = winding_occupancy_face
         elif integrate_method == 'vertex':
-            self.Winding_Occupancy = Winding_Occupancy
+            self.winding_occupancy = winding_occupancy
 
     def forward(self, mesh_src: Meshes, output_resolution=256, max_v_per_call=2000, if_binary=False):
         """
@@ -417,10 +450,10 @@ class Differentiable_SDF(nn.Module):
         for i in range(0, coordinates.shape[0]):
             tem_charge = coordinates[i]
 
-            occupency_temp = self.Winding_Occupancy(mesh_src, tem_charge,max_v_per_call=max_v_per_call)
+            occupency_temp = self.winding_occupancy(mesh_src, tem_charge,max_v_per_call=max_v_per_call)
 
             if if_binary:
-                occupency_temp = torch.sigmoid((self.Winding_Occupancy(mesh_src, tem_charge,max_v_per_call=max_v_per_call)-0.5)*100)
+                occupency_temp = torch.sigmoid((self.winding_occupancy(mesh_src, tem_charge,max_v_per_call=max_v_per_call)-0.5)*100)
 
             occupency_fields.append(occupency_temp)
 
@@ -447,20 +480,6 @@ class Differentiable_SDF(nn.Module):
         return whole_image
     
 
-
-
-def normalize_mesh(mesh, rescalar=1.1):
-    bbox = mesh.get_bounding_boxes()
-    B = bbox.shape[0]
-    center = (bbox[:, :, 0] + bbox[:, :, 1]) / 2
-    center = center.view(B, 1, 3)
-    size = (bbox[:, :, 1] - bbox[:, :, 0]) 
-
-    scale = 2.0 / (torch.max(size, dim=-1)[0]*rescalar+1e-8)
-    scale = scale.view(B, 1, 1)
-
-    mesh = mesh.update_padded((mesh.verts_padded()-center)*scale)
-    return mesh
 
 
 
@@ -527,6 +546,8 @@ class SolidAngleOccp(nn.Module):
 
         return torch.cat(occp, dim=-1)
 
+## differentiable signed distance field
+
 def occupancy(mesh: Meshes, pt_target : torch.Tensor, allow_grad: bool = False, max_query_point_batch_size=2000, max_face_batch_size=10000):
     solid_angle_occp = SolidAngleOccp(mesh, allow_grad)
     if allow_grad:
@@ -548,6 +569,8 @@ def signed_distance_field(mesh: Meshes, pt_target : torch.Tensor, allow_grad: bo
     sign = 2*(occp.view(-1)-0.5)
     return sign*dist
 
+
+## Components-wise Occupancy
 
 class SolidAngleOccp_components(nn.Module):
 
@@ -593,9 +616,6 @@ class SolidAngleOccp_components(nn.Module):
             assert gather_label.shape[0] == self.face_coord.shape[0]
             assert gather_label.shape[1] == self.face_coord.shape[1]
         
-        
-            
-
 
         occp = []
 
@@ -647,65 +667,6 @@ class SolidAngleOccp_components(nn.Module):
             occp.append(occp_term/np.pi/2)
 
         return torch.cat(occp, dim=1)
-
-
-
-
-def flexible_occupancy(mesh: trimesh.Trimesh, pt_target : torch.Tensor, allow_grad: bool = False, max_query_point_batch_size=2000, max_face_batch_size=10000):
-
-    component_indx = trimesh.graph.connected_component_labels(mesh.face_adjacency)
-    component_indx = torch.from_numpy(component_indx).to(pt_target.device)
-
-    mesh_tem = Meshes(verts=[torch.from_numpy(mesh.vertices).float().to(pt_target.device)], 
-                        faces=[torch.from_numpy(mesh.faces).long().to(pt_target.device)])
-
-    solid_angle_occp = SolidAngleOccp_components(mesh_tem, allow_grad)
-
-
-    mesh_verts_new = mesh_tem.verts_padded().clone() - mesh_tem.verts_normals_padded()*1e-2
-
-
-    # faces_new = mesh_tem.faces_packed().clone()[non_closed_index,:]
-    faces_new = mesh_tem.faces_padded().clone()
-    faces_new = faces_new[:,:,[0,2,1]]
-
-
-    # new_mesh = Meshes(verts=[mesh_verts_new], faces=[face_new])
-
-    # merge the old and new mesh
-    B = mesh_tem.faces_padded().shape[0]
-    mesh_flipped = Meshes(verts=[mesh_verts_new[i] for i in range(B)], faces=[faces_new[i] for i in range(B)])
-
-    if allow_grad:
-        occp = solid_angle_occp(pt_target, max_face_batch_size = max_face_batch_size, 
-                                max_query_point_batch_size=max_query_point_batch_size, 
-                                gather_label=component_indx)
-        solid_angle_occp = SolidAngleOccp_components(mesh_flipped, allow_grad)
-        occp_flipped = solid_angle_occp(pt_target, max_face_batch_size = max_face_batch_size, 
-                                        max_query_point_batch_size=max_query_point_batch_size, 
-                                        gather_label=component_indx)
-    else:
-        with torch.no_grad():
-            occp = solid_angle_occp(pt_target, max_face_batch_size= max_face_batch_size, 
-                                    max_query_point_batch_size=max_query_point_batch_size, 
-                                    gather_label=component_indx)
-            solid_angle_occp = SolidAngleOccp_components(mesh_flipped, allow_grad)
-            occp_flipped = solid_angle_occp(pt_target, max_face_batch_size= max_face_batch_size, 
-                                            max_query_point_batch_size=max_query_point_batch_size, 
-                                            gather_label=component_indx)
-
-        B_indx, N_indx, C_indx = torch.where(((occp - occp.round()).abs()< 1e-2)*(occp.round().abs() > 0.5))
-
-        occp_result = torch.zeros_like(occp[...,0])
-
-        occp_result[B_indx, N_indx] = 1.0   
-
-        occp_result = torch.where(occp_result == 0, (occp_flipped+occp).sum(-1).abs(), occp_result)
-
-        occp_result = torch.sigmoid(10*(occp_result - 0.5))
-
-    return occp_result
-
 
 
 
@@ -771,3 +732,154 @@ def flexible_occupancy(mesh: Meshes, pt_target : torch.Tensor,
         occp_result = torch.sigmoid(10*(occp_result - 0.5))
 
     return occp_result
+
+
+
+### -------------Rapid Occupancy Extraction (non-differentiable)--------------------------------------------
+
+
+@torch.no_grad()
+def get_sdf_from_mesh(mesh: Meshes, query_points: torch.Tensor, threshold=0.5, open_thinkness=1e-2):
+    """
+    Compute the signed distance field (SDF) of the mesh at the query points.
+    The SDF is positive inside the mesh and negative outside the mesh.
+    Args:
+        mesh: Meshes object representing the mesh.
+        query_points: Tensor of shape (N, 3) giving the coordinates of the query points.
+        threshold: threshold for the occupancy.
+        open_thinkness: the thickness of the open surface, to determine the occupancy for a non-watertight mesh.
+    Returns:
+        sdf: Tensor of shape (N,) giving the signed distance field at the query points.
+    """
+
+    occp, mesh = get_occp_from_mesh(mesh, query_points, threshold, open_thinkness, return_meshes=True)
+
+
+    rescale = 1e5
+    udf, _ = _C.point_face_dist_forward(query_points.view(-1, 3)*rescale,
+                    torch.tensor([0], device=mesh.device),
+                    rescale*mesh.verts_packed()[mesh.faces_packed(),:],
+                    torch.tensor([0], device=mesh.device),
+                    query_points.shape[0], 1e-8)
+    
+    udf = udf.view(-1)/rescale
+    sdf = torch.where(occp > 0.5, -udf, udf)
+
+    return sdf
+
+@torch.no_grad()
+def get_occp_from_mesh(mesh: Meshes, query_points: torch.Tensor, threshold=0.5, 
+                       open_thinkness=1e-2, return_meshes=False):
+    """
+    Compute the occupancy of the mesh at the query points.
+    Args:
+        mesh: Meshes object representing the mesh.
+        query_points: Tensor of shape (N, 3) giving the coordinates of the query points.
+        threshold: threshold for the occupancy.
+        open_thinkness: the thickness of the open surface, to determine the occupancy for a non-watertight mesh.
+        return_meshes: whether to return the meshes with the flipped faces.
+    Returns:
+        occp: Tensor of shape (N,) giving the occupancy at the query points.
+    """
+    trimesh_tem = trimesh.Trimesh(vertices=mesh.verts_packed().detach().cpu().numpy(),
+                                faces=mesh.faces_packed().detach().cpu().numpy())
+
+    # component_indx = trimesh.graph.connected_component_labels(trimesh_tem.face_adjacency)
+    # component_indx = torch.from_numpy(component_indx).to(device)
+    trimesh_tem_components = trimesh.graph.split(trimesh_tem, only_watertight=False)
+    trimesh_tem_components = sorted(trimesh_tem_components, key=lambda x: x.faces.shape[0], reverse=True)
+
+    occp = torch.zeros(query_points.shape[0], dtype=torch.float32, device=query_points.device)
+    loop = tqdm(trimesh_tem_components)
+
+    n_points = query_points.shape[0]
+    device = query_points.device
+    meshes = [] # store the meshes 
+    for component_indx, component in enumerate(loop):
+        # component.fix_normals()
+        mesh_tem = Meshes(verts=[torch.from_numpy(component.vertices).float().to(device)],
+                            faces=[torch.from_numpy(component.faces).long().to(device)])
+        
+        occp_component = torch.zeros(n_points).to(device)
+
+        meshes.append(mesh_tem)
+        bbox_tem = mesh_tem.get_bounding_boxes()[0]
+        inbbox_indx = (
+            (query_points[:, 0] >= bbox_tem[0, 0]) & (query_points[:, 0] <= bbox_tem[0, 1]) &
+            (query_points[:, 1] >= bbox_tem[1, 0]) & (query_points[:, 1] <= bbox_tem[1, 1]) &
+            (query_points[:, 2] >= bbox_tem[2, 0]) & (query_points[:, 2] <= bbox_tem[2, 1])
+        )
+        inbbox_indx = torch.where(inbbox_indx)[0]
+        loop.set_description(f'Components {component_indx+1}/{len(trimesh_tem_components)}:  {mesh_tem.faces_packed().shape[0]} faces; {len(inbbox_indx)} queries')
+        if len(inbbox_indx) == 0:
+            continue
+        with torch.no_grad():
+            solid_angle_occp = SolidAngleOccp(mesh_tem, False).half()
+            occp_inbbox = solid_angle_occp(query_points[inbbox_indx].half(), 
+                                           max_query_point_batch_size=20000).view(-1)
+
+        query_points_flipped = query_points[inbbox_indx]
+        if not component.is_watertight:
+            ## create a new mesh with the flipped faces
+            mesh_verts_flipped = mesh_tem.verts_packed().clone() - mesh_tem.verts_normals_packed()*open_thinkness
+            faces_flipped = mesh_tem.faces_packed().clone()
+            faces_flipped = faces_flipped[:,[0,2,1]]
+            mesh_flipped = Meshes(verts=[mesh_verts_flipped], faces=[faces_flipped])
+            meshes.append(mesh_flipped)
+            with torch.no_grad():
+                solid_angle_occp_flipped = SolidAngleOccp(mesh_flipped, False).half()
+                occp_flipped = solid_angle_occp_flipped(query_points_flipped.half(), 
+                                                        max_query_point_batch_size=20000).view(-1)
+            occp_inbbox = occp_flipped+occp_inbbox
+
+        occp_component[inbbox_indx] = torch.sigmoid(10*(occp_inbbox.abs() - threshold))
+        
+        # Update the occupancy
+        occp = torch.max(occp, occp_component)
+
+        # occp = torch.sigmoid(10*(occp.abs() - 0.5))
+
+        occp = torch.where(occp.abs() > threshold, 1., 0.) 
+
+    if return_meshes:
+        meshes = Meshes([mesh.verts_packed().clone() for mesh in meshes], [mesh.faces_packed().clone() for mesh in meshes])
+        return occp, meshes
+    return occp
+
+def get_flipped_mesh(mesh: Meshes, open_thinkness=1e-2):
+    """
+    Get the mesh with the flipped faces for non-watertight components.
+    Args:
+        mesh: Meshes object representing the mesh.
+        open_thinkness: the thickness of the open surface, to determine the occupancy for a non-watertight mesh.
+    Returns:
+        mesh_flipped: Meshes object representing the mesh with the flipped faces.
+    """
+    trimesh_tem = trimesh.Trimesh(vertices=mesh.verts_packed().detach().cpu().numpy(),
+                                faces=mesh.faces_packed().detach().cpu().numpy())
+
+    # component_indx = trimesh.graph.connected_component_labels(trimesh_tem.face_adjacency)
+    # component_indx = torch.from_numpy(component_indx).to(device)
+    trimesh_tem_components = trimesh.graph.split(trimesh_tem, only_watertight=False)
+    trimesh_tem_components = sorted(trimesh_tem_components, key=lambda x: x.faces.shape[0], reverse=True)
+
+    meshes = []
+    device = mesh.device
+    for component_indx, component in enumerate(trimesh_tem_components):
+        component.fix_normals()
+
+        mesh_tem = Meshes(verts=[torch.from_numpy(component.vertices).float().to(device)],
+                            faces=[torch.from_numpy(component.faces).long().to(device)])
+        
+        meshes.append(mesh_tem)
+        if not component.is_watertight:
+            ## create a new mesh with the flipped faces
+            mesh_verts_flipped = mesh_tem.verts_packed().clone() - mesh_tem.verts_normals_packed()*open_thinkness
+            faces_flipped = mesh_tem.faces_packed().clone()
+            faces_flipped = faces_flipped[:,[0,2,1]]
+            mesh_flipped = Meshes(verts=[mesh_verts_flipped], faces=[faces_flipped])
+            meshes.append(mesh_flipped)
+
+    meshes = Meshes([mesh.verts_packed().clone() for mesh in meshes], [mesh.faces_packed().clone() for mesh in meshes])
+    meshes = Meshes(verts=[meshes.verts_packed().clone()], faces=[meshes.faces_packed().clone()])
+    return meshes

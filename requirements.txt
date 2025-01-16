@@ -1,8 +1,8 @@
 einops==0.8.0
 matplotlib==3.8.2
-numpy==2.0.0
-pytorch3d==0.7.5
-torch==2.0.1
-torch_scatter==2.1.1+pt20cu118
+numpy==1.26.4
+# pytorch3d==0.7.5
+# torch==2.1.1+cu118
+# torch_scatter==2.1.1+pt20cu118
 trimesh==4.0.10
 pymcubes==0.1.2
