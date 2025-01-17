@@ -739,7 +739,7 @@ def flexible_occupancy(mesh: Meshes, pt_target : torch.Tensor,
 
 
 @torch.no_grad()
-def get_sdf_from_mesh(mesh: Meshes, query_points: torch.Tensor, threshold=0.5, open_thinkness=1e-2):
+def get_sdf_from_mesh(mesh: Meshes, query_points: torch.Tensor, threshold=0.49, open_thinkness=1e-2):
     """
     Compute the signed distance field (SDF) of the mesh at the query points.
     The SDF is positive inside the mesh and negative outside the mesh.
@@ -751,25 +751,27 @@ def get_sdf_from_mesh(mesh: Meshes, query_points: torch.Tensor, threshold=0.5, o
     Returns:
         sdf: Tensor of shape (N,) giving the signed distance field at the query points.
     """
+    bbox = mesh.get_bounding_boxes()[0]
 
-    occp, mesh = get_occp_from_mesh(mesh, query_points, threshold, open_thinkness, return_meshes=True)
-
-
-    rescale = 1e5
+    rescale = np.sqrt(6)/torch.max(torch.abs(bbox[1]-bbox[0]))*10
+    
     udf, _ = _C.point_face_dist_forward(query_points.view(-1, 3)*rescale,
                     torch.tensor([0], device=mesh.device),
-                    rescale*mesh.verts_packed()[mesh.faces_packed(),:],
+                    (rescale*mesh.verts_packed())[mesh.faces_packed(),:],
                     torch.tensor([0], device=mesh.device),
                     query_points.shape[0], 1e-8)
     
-    udf = udf.view(-1)/rescale
-    sdf = torch.where(occp > 0.5, -udf, udf)
+    udf = udf.view(-1)/(rescale**2)
+
+    occp = get_occp_from_mesh(mesh, query_points, threshold, open_thinkness, return_meshes=False, if_smooth=True)
+
+    sdf = ((0.5 - occp)*2).view(-1)*udf
 
     return sdf
 
 @torch.no_grad()
-def get_occp_from_mesh(mesh: Meshes, query_points: torch.Tensor, threshold=0.5, 
-                       open_thinkness=1e-2, return_meshes=False):
+def get_occp_from_mesh(mesh: Meshes, query_points: torch.Tensor, threshold=0.49, 
+                       open_thinkness=1e-2, return_meshes=False, if_smooth=False):
     """
     Compute the occupancy of the mesh at the query points.
     Args:
@@ -784,8 +786,6 @@ def get_occp_from_mesh(mesh: Meshes, query_points: torch.Tensor, threshold=0.5,
     trimesh_tem = trimesh.Trimesh(vertices=mesh.verts_packed().detach().cpu().numpy(),
                                 faces=mesh.faces_packed().detach().cpu().numpy())
 
-    # component_indx = trimesh.graph.connected_component_labels(trimesh_tem.face_adjacency)
-    # component_indx = torch.from_numpy(component_indx).to(device)
     trimesh_tem_components = trimesh.graph.split(trimesh_tem, only_watertight=False)
     trimesh_tem_components = sorted(trimesh_tem_components, key=lambda x: x.faces.shape[0], reverse=True)
 
@@ -832,19 +832,22 @@ def get_occp_from_mesh(mesh: Meshes, query_points: torch.Tensor, threshold=0.5,
                                                         max_query_point_batch_size=20000).view(-1)
             occp_inbbox = occp_flipped+occp_inbbox
 
-        occp_component[inbbox_indx] = torch.sigmoid(10*(occp_inbbox.abs() - threshold))
+        occp_component[inbbox_indx] = torch.sigmoid(10*(occp_inbbox.abs() - 0.4999))
         
         # Update the occupancy
         occp = torch.max(occp, occp_component)
-
-        # occp = torch.sigmoid(10*(occp.abs() - 0.5))
-
-        occp = torch.where(occp.abs() > threshold, 1., 0.) 
+        if if_smooth:
+            occp = torch.sigmoid(1e3*(occp-threshold))
+        else:
+            occp = torch.where(occp.abs() > threshold, 1., 0.) 
 
     if return_meshes:
         meshes = Meshes([mesh.verts_packed().clone() for mesh in meshes], [mesh.faces_packed().clone() for mesh in meshes])
+        meshes = Meshes(verts=[meshes.verts_packed().clone()], faces=[meshes.faces_packed().clone()])
         return occp, meshes
     return occp
+
+
 
 def get_flipped_mesh(mesh: Meshes, open_thinkness=1e-2):
     """

@@ -10,8 +10,10 @@ import pytorch3d._C as _C
 import trimesh
 import math
 
+import mcubes 
+
 def grid_smaple_sdf(mesh, resolution=128,  mode='sdf', out_dir=None,
-                    rescalar = 0.9, open_thinkness = 1e-2*2):
+                    rescalar = 0.9, open_thinkness = 1e-2, if_remesh=True):
     """
     Sample the signed distance field (SDF) of the mesh using octree. 
     The whole space is divided into 8^resolution voxels and nomalized into [-1, 1]^3.
@@ -32,6 +34,7 @@ def grid_smaple_sdf(mesh, resolution=128,  mode='sdf', out_dir=None,
     if isinstance(mesh, str):
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         name = os.path.splitext(os.path.basename(mesh))[0]
+
         mesh = load_objs_as_meshes([mesh], device=device)
     elif isinstance(mesh, Meshes):
         device = mesh.device
@@ -48,54 +51,72 @@ def grid_smaple_sdf(mesh, resolution=128,  mode='sdf', out_dir=None,
     
     mesh = normalize_mesh(mesh, rescalar=rescalar)
 
+    if mesh.faces_packed().shape[0] > 20000:
+        print('Warning: The mesh is too large, it may take a long time to compute the SDF.')
+
+    save_obj(os.path.join(out_dir, name + '_ori.obj'), mesh.verts_packed(), mesh.faces_packed())
+
 
     coordinates_downsampled = torch.stack(torch.meshgrid(torch.linspace(-1., 1., resolution),
                                                         torch.linspace(-1., 1., resolution),
                                                         torch.linspace(-1., 1., resolution),
                                                         indexing='ij'
                                                         ), dim=-1)
-    # coordinates_downsampled = torch.stack(torch.meshgrid(torch.linspace(-0.5, 0.5, resolution),
-    #                                                         torch.linspace(-0.5, 0.5, resolution),
-    #                                                         torch.linspace(-0.5, 0.5, resolution),
-    #                                                         indexing='ij'
-    #                                                         ), dim=-1)
-    coordinates_downsampled = rearrange(coordinates_downsampled, 'x y z c -> (z y x) c').to(device)
+    
+    coordinates_downsampled = rearrange(coordinates_downsampled, 'x y z c -> (x y z) c').to(device)
 
     if mode == 'sdf':
         field = get_sdf_from_mesh(mesh, 
                                     coordinates_downsampled, 
-                                    threshold=0.4,
+                                    threshold=0.49,
                                     open_thinkness=open_thinkness)
+
+        
     elif mode == 'occupancy' or mode == 'occp':
         mode = 'occp'
         field = get_occp_from_mesh(mesh, 
                                         coordinates_downsampled, 
-                                        threshold=0.4, open_thinkness=open_thinkness)
-    
+                                        threshold=0.49, open_thinkness=open_thinkness)
     else:
         raise ValueError('mode not supported yet: only support sdf and occupancy')
     
-    field = rearrange(field, '(z y x) -> 1 z y x', z=resolution, y=resolution, x=resolution)
+    print('Field Done, Remeshing...')
+    
+    field = rearrange(field, '(x y z) -> x y z', z=resolution, y=resolution, x=resolution)
 
+    if if_remesh:
+        if mode == 'sdf':
+            vertices, faces = mcubes.marching_cubes(field.cpu().numpy(), 1e-6)
+            vertices = vertices/(resolution-1)*2.-1.
 
-    if mode == 'sdf':
-        cubified = cubify(-field, 0.0) # march cubes to get the mesh
-    elif mode == 'occp':
-        cubified = cubify(field, 0.5)
+        elif mode == 'occp':
+            vertices, faces = mcubes.marching_cubes(field.cpu().numpy(), 0.5)
+            vertices = vertices/(resolution-1)*2.-1.
+
+        trimesh_tem = trimesh.Trimesh(vertices=vertices, faces=faces)
 
     if out_dir is not None:
         if not os.path.exists(out_dir):
             os.makedirs(out_dir)
+        
         np.save(os.path.join(out_dir, name + '_' + mode + f'_{resolution}.npy'), field.squeeze().cpu().numpy())
-        save_obj(os.path.join(out_dir, name + '_ori.obj'),
-                    mesh.verts_list()[0], mesh.faces_list()[0])
-        save_obj(os.path.join(out_dir, name + '_' +mode +f'_{resolution}.obj'),
-                 cubified.verts_list()[0], cubified.faces_list()[0])
-        
         print('Field saved to', os.path.join(out_dir, name + '_' + mode + f'_{resolution}.npy'))
-        print('Re-mesh saved to', os.path.join(out_dir, name + '_' + mode + f'_{resolution}.obj'))
-        
-    return field, cubified
+        print('Field in format of np.array with shape (X, Y, Z) but returned value is tensor with shape (1, Z, Y, X)')
+
+
+        if if_remesh:
+            obj_path = os.path.join(out_dir, name + '_' +mode +f'_{resolution}.obj')
+            trimesh_tem.export(obj_path)
+            print('Re-mesh saved to', obj_path)
+
+    field = field.permute(2,1,0).unsqueeze(0)
+    if if_remesh:
+        mesh = Meshes(verts=[torch.from_numpy(trimesh_tem.vertices).float().to(device)],
+                        faces=[torch.from_numpy(trimesh_tem.faces).long().to(device)])
+
+        return field, mesh
+    else:
+        return field
 
 # main
 if __name__ == '__main__':
@@ -105,8 +126,8 @@ if __name__ == '__main__':
     parser.add_argument('--mode', type=str, default='sdf', help='sdf or occupancy')
     parser.add_argument('--resolution', type=int, default=256, help='resolution of the SDF')
     parser.add_argument('--out_dir', type=str, default='./output', help='directory to save the SDF')
-    parser.add_argument('--rescalar', type=float, default=0.9, help='rescale factor')
-    parser.add_argument('--open_thinkness', type=float, default=1e-2*2, help='open thinkness')
+    parser.add_argument('--rescalar', type=float, default=0.99, help='rescale factor')
+    parser.add_argument('--open_thinkness', type=float, default=1e-2, help='open thinkness')
     args = parser.parse_args()
     print('Mode:', args.mode)
     
