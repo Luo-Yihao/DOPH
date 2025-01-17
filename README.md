@@ -28,7 +28,7 @@ pip install -r requirements.txt
 ## Usage
 Run the following command to convert a mesh to occupancy and SDF (No gradient but with GPU acceleration):
 ```shell
-python mesh2sdf.py --mesh data_example/Bull.obj --mode occpancy --resolution 256 
+python mesh2sdf.py --mesh data_example/Bull.obj --mode occp --resolution 256 
 ```
 The occupancy and SDF will be saved in the `output` folder, containing the following files:
 ```shell
