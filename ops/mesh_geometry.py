@@ -761,7 +761,7 @@ def get_sdf_from_mesh(mesh: Meshes, query_points: torch.Tensor, threshold=0.49, 
                     torch.tensor([0], device=mesh.device),
                     query_points.shape[0], 1e-8)
     
-    udf = udf.view(-1)/(rescale**2)
+    udf = udf.view(-1).sqrt()/rescale
 
     occp = get_occp_from_mesh(mesh, query_points, threshold, open_thinkness, return_meshes=False, if_smooth=True)
 
@@ -770,7 +770,7 @@ def get_sdf_from_mesh(mesh: Meshes, query_points: torch.Tensor, threshold=0.49, 
     return sdf
 
 @torch.no_grad()
-def get_occp_from_mesh(mesh: Meshes, query_points: torch.Tensor, threshold=0.49, 
+def get_occp_from_mesh(mesh: Meshes, query_points: torch.Tensor, threshold=0.5, 
                        open_thinkness=1e-2, return_meshes=False, if_smooth=False):
     """
     Compute the occupancy of the mesh at the query points.
@@ -830,14 +830,27 @@ def get_occp_from_mesh(mesh: Meshes, query_points: torch.Tensor, threshold=0.49,
                 solid_angle_occp_flipped = SolidAngleOccp(mesh_flipped, False).half()
                 occp_flipped = solid_angle_occp_flipped(query_points_flipped.half(), 
                                                         max_query_point_batch_size=20000).view(-1)
-            occp_inbbox = occp_flipped+occp_inbbox
+            
+            # full_occp_inbbox = torch.stack([(occp_flipped+occp_inbbox).abs(), occp_inbbox.abs(), occp_flipped.abs()], dim=-1)
 
-        occp_component[inbbox_indx] = torch.sigmoid(10*(occp_inbbox.abs() - 0.4999))
+            full_occp_inbbox = torch.stack([occp_flipped, occp_inbbox], dim=-1)
+            softmax_occp = F.softmax(1e3*full_occp_inbbox, dim=-1)
+            softmax_occp = (softmax_occp*full_occp_inbbox).sum(-1)
+
+            if_inside = torch.sigmoid(1e5*(occp_inbbox**2 - 0.99**2))+torch.sigmoid(1e5*(occp_flipped**2 - 0.99**2))
+            if_inside_soft = torch.sigmoid(1e4*(if_inside - 1))
+            occp_inbbox = (1-if_inside_soft)*(occp_inbbox+occp_flipped)+if_inside_soft*torch.max(occp_inbbox.abs(), occp_flipped.abs())
+
+        else:
+            occp_inbbox = torch.sigmoid(1e5*(occp_inbbox.abs() - 0.5))
+     
+
+        occp_component[inbbox_indx] = occp_inbbox
         
         # Update the occupancy
         occp = torch.max(occp, occp_component)
         if if_smooth:
-            occp = torch.sigmoid(1e3*(occp-threshold))
+            occp = torch.sigmoid(1e5*(occp-threshold))
         else:
             occp = torch.where(occp.abs() > threshold, 1., 0.) 
 

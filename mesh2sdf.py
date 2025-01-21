@@ -9,11 +9,14 @@ from pytorch3d.ops import sample_points_from_meshes, cubify
 import pytorch3d._C as _C
 import trimesh
 import math
+import scipy.ndimage as ndimage
+from skimage.measure import marching_cubes
 
-import mcubes 
+
 
 def grid_smaple_sdf(mesh, resolution=128,  mode='sdf', out_dir=None,
-                    rescalar = 0.9, open_thinkness = 1e-2, if_remesh=True):
+                    rescalar = 0.9, threshold=0.499,
+                    open_thinkness = 1e-2, if_remesh=True):
     """
     Sample the signed distance field (SDF) of the mesh using octree. 
     The whole space is divided into 8^resolution voxels and nomalized into [-1, 1]^3.
@@ -54,7 +57,10 @@ def grid_smaple_sdf(mesh, resolution=128,  mode='sdf', out_dir=None,
     if mesh.faces_packed().shape[0] > 20000:
         print('Warning: The mesh is too large, it may take a long time to compute the SDF.')
 
-    save_obj(os.path.join(out_dir, name + '_ori.obj'), mesh.verts_packed(), mesh.faces_packed())
+    if out_dir is not None:
+        if not os.path.exists(out_dir):
+            os.makedirs(out_dir)
+        save_obj(os.path.join(out_dir, name + '_ori.obj'), mesh.verts_packed(), mesh.faces_packed())
 
 
     coordinates_downsampled = torch.stack(torch.meshgrid(torch.linspace(-1., 1., resolution),
@@ -68,7 +74,7 @@ def grid_smaple_sdf(mesh, resolution=128,  mode='sdf', out_dir=None,
     if mode == 'sdf':
         field = get_sdf_from_mesh(mesh, 
                                     coordinates_downsampled, 
-                                    threshold=0.49,
+                                    threshold=threshold,
                                     open_thinkness=open_thinkness)
 
         
@@ -76,7 +82,7 @@ def grid_smaple_sdf(mesh, resolution=128,  mode='sdf', out_dir=None,
         mode = 'occp'
         field = get_occp_from_mesh(mesh, 
                                         coordinates_downsampled, 
-                                        threshold=0.49, open_thinkness=open_thinkness)
+                                        threshold=threshold, open_thinkness=open_thinkness)
     else:
         raise ValueError('mode not supported yet: only support sdf and occupancy')
     
@@ -86,20 +92,26 @@ def grid_smaple_sdf(mesh, resolution=128,  mode='sdf', out_dir=None,
 
     if if_remesh:
         if mode == 'sdf':
-            vertices, faces = mcubes.marching_cubes(field.cpu().numpy(), 1e-6)
+            field_np = field.cpu().numpy()
+            vertices, faces, normals, _ = marching_cubes(field_np, 1e-5, allow_degenerate=False)
             vertices = vertices/(resolution-1)*2.-1.
 
         elif mode == 'occp':
-            vertices, faces = mcubes.marching_cubes(field.cpu().numpy(), 0.5)
+            field_np = field.cpu().numpy()
+            # vertices, faces = mcubes.marching_cubes(mcubes.smooth(fiel_np), 0)
+            vertices, faces, normals, _ = marching_cubes(field_np, 0.5, allow_degenerate=False)
             vertices = vertices/(resolution-1)*2.-1.
 
-        trimesh_tem = trimesh.Trimesh(vertices=vertices, faces=faces)
+        trimesh_tem = trimesh.Trimesh(vertices=vertices, faces=faces, normals=normals)
+        # decimate the mesh
+        # trimesh_tem = trimesh_tem.simplify_quadric_decimation(20000)
+        trimesh_tem = trimesh.smoothing.filter_mut_dif_laplacian(trimesh_tem, lamb=0.5, iterations=50)
 
     if out_dir is not None:
         if not os.path.exists(out_dir):
             os.makedirs(out_dir)
         
-        np.save(os.path.join(out_dir, name + '_' + mode + f'_{resolution}.npy'), field.squeeze().cpu().numpy())
+        np.save(os.path.join(out_dir, name + '_' + mode + f'_{resolution}.npy'), field.cpu().numpy())
         print('Field saved to', os.path.join(out_dir, name + '_' + mode + f'_{resolution}.npy'))
         print('Field in format of np.array with shape (X, Y, Z) but returned value is tensor with shape (1, Z, Y, X)')
 
@@ -120,13 +132,15 @@ def grid_smaple_sdf(mesh, resolution=128,  mode='sdf', out_dir=None,
 
 # main
 if __name__ == '__main__':
+    # nohup python -u mesh2sdf.py --mesh data_example/car.obj --mode occp --resolution 512 --out_dir ./output --rescalar 0.99 --open_thinkness 1e-2 > log.txt 2>&1 &
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--mesh', type=str, default='data_example/Chival.obj', help='path to the mesh')
     parser.add_argument('--mode', type=str, default='sdf', help='sdf or occupancy')
     parser.add_argument('--resolution', type=int, default=256, help='resolution of the SDF')
     parser.add_argument('--out_dir', type=str, default='./output', help='directory to save the SDF')
-    parser.add_argument('--rescalar', type=float, default=0.99, help='rescale factor')
+    parser.add_argument('--rescalar', type=float, default=0.95, help='rescale factor')
+    parser.add_argument('--threshold', type=float, default=0.499, help='threshold')
     parser.add_argument('--open_thinkness', type=float, default=1e-2, help='open thinkness')
     args = parser.parse_args()
     print('Mode:', args.mode)
