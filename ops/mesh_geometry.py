@@ -759,7 +759,7 @@ def get_sdf_from_mesh(mesh: Meshes, query_points: torch.Tensor, threshold=0.49, 
                     torch.tensor([0], device=mesh.device),
                     (rescale*mesh.verts_packed())[mesh.faces_packed(),:],
                     torch.tensor([0], device=mesh.device),
-                    query_points.shape[0], 1e-8)
+                    query_points.view(-1, 3).shape[0], 1e-8)
     
     udf = udf.view(-1).sqrt()/rescale
 
@@ -783,8 +783,8 @@ def get_occp_from_mesh(mesh: Meshes, query_points: torch.Tensor, threshold=0.5,
     Returns:
         occp: Tensor of shape (N,) giving the occupancy at the query points.
     """
-    trimesh_tem = trimesh.Trimesh(vertices=mesh.verts_packed().detach().cpu().numpy(),
-                                faces=mesh.faces_packed().detach().cpu().numpy())
+    
+    trimesh_tem = mesh_prepare(mesh, return_trimesh=True, iters=10)
 
     trimesh_tem_components = trimesh.graph.split(trimesh_tem, only_watertight=False)
     trimesh_tem_components = sorted(trimesh_tem_components, key=lambda x: x.faces.shape[0], reverse=True)
@@ -797,8 +797,7 @@ def get_occp_from_mesh(mesh: Meshes, query_points: torch.Tensor, threshold=0.5,
     meshes = [] # store the meshes 
     for component_indx, component in enumerate(loop):
         # component.fix_normals()
-        mesh_tem = Meshes(verts=[torch.from_numpy(component.vertices).float().to(device)],
-                            faces=[torch.from_numpy(component.faces).long().to(device)])
+        mesh_tem = mesh_prepare(component, iters=3, device=device)
         
         occp_component = torch.zeros(n_points).to(device)
 
@@ -899,3 +898,35 @@ def get_flipped_mesh(mesh: Meshes, open_thinkness=1e-2):
     meshes = Meshes([mesh.verts_packed().clone() for mesh in meshes], [mesh.faces_packed().clone() for mesh in meshes])
     meshes = Meshes(verts=[meshes.verts_packed().clone()], faces=[meshes.faces_packed().clone()])
     return meshes
+
+
+
+
+def mesh_prepare(mesh, iters=3, return_trimesh=False, device='cuda'):
+    if isinstance(mesh, str):
+        trimesh_tem = trimesh.load(mesh)
+    elif isinstance(mesh, Meshes):
+        trimesh_tem = trimesh.Trimesh(vertices=mesh.verts_packed().cpu().numpy(), faces=mesh.faces_packed().cpu().numpy())
+    elif isinstance(mesh, trimesh.Trimesh):
+        trimesh_tem = mesh
+    else:
+        raise ValueError('mesh type not supported yet: only support str, Meshes and trimesh.Trimesh')
+    
+    for i in range(iters):
+        trimesh_tem.remove_degenerate_faces()
+        trimesh_tem.update_faces(trimesh_tem.unique_faces())
+        trimesh_tem.remove_infinite_values()
+        trimesh_tem.remove_unreferenced_vertices()
+        trimesh_tem.merge_vertices()
+        trimesh_tem.fix_normals()
+
+    
+
+    trimesh_tem = trimesh.Trimesh(vertices=trimesh_tem.vertices, faces=trimesh_tem.faces, force='mesh')
+    if return_trimesh:
+        return trimesh_tem
+    
+    mesh_tem = Meshes(verts=[torch.tensor(trimesh_tem.vertices).float()], 
+                    faces=[torch.tensor(trimesh_tem.faces).long()])
+    mesh_tem = mesh_tem.to(device)
+    return mesh_tem

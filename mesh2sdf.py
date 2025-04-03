@@ -1,18 +1,26 @@
 import os
-import torch
-
-from ops.mesh_geometry import *
-from pytorch3d.structures import Meshes, Pointclouds
-from pytorch3d.io import load_obj, load_objs_as_meshes, save_obj
-from pytorch3d.ops import sample_points_from_meshes, cubify
-
-import pytorch3d._C as _C
-import trimesh
+import sys
 import math
+import torch
+import trimesh
+import numpy as np
+import multiprocessing as mp
 import scipy.ndimage as ndimage
+from tqdm import tqdm
+from skimage import measure, morphology
 from skimage.measure import marching_cubes
 
+from pytorch3d.structures import Meshes, Pointclouds
+from pytorch3d.io import load_obj, load_objs_as_meshes, save_obj
 
+from ops.mesh_geometry import *
+
+import pyvista as pv
+import cubvh
+
+# Configure pyvista
+pv.start_xvfb(wait=0)
+pv.set_jupyter_backend('html')
 
 def grid_smaple_sdf(mesh, resolution=128,  mode='sdf', out_dir=None,
                     rescalar = 0.9, threshold=0.499,
@@ -137,21 +145,178 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--mesh', type=str, default='data_example/Chival.obj', help='path to the mesh')
     parser.add_argument('--mode', type=str, default='sdf', help='sdf or occupancy')
-    parser.add_argument('--resolution', type=int, default=256, help='resolution of the SDF')
+    parser.add_argument('--resolution', type=int, default=512, help='resolution of the SDF')
     parser.add_argument('--out_dir', type=str, default='./output', help='directory to save the SDF')
     parser.add_argument('--rescalar', type=float, default=0.95, help='rescale factor')
-    parser.add_argument('--threshold', type=float, default=0.499, help='threshold')
-    parser.add_argument('--open_thinkness', type=float, default=1e-2, help='open thinkness')
+    parser.add_argument('--threshold', type=float, default=0.99, help='threshold')
+    parser.add_argument('--open_thinkness', type=float, default=None, help='open thinkness')
+    parser.add_argument('--device', type=str, default='cuda:0', help='device')
+    parser.add_argument('--if_remesh', type=bool, default=True, help='if remesh')
     args = parser.parse_args()
     print('Mode:', args.mode)
+
+    out_dir = args.out_dir
+    mode = args.mode
+
+    resolution = args.resolution
+    eps = 1/(resolution)
+    rescalar = args.rescalar
+    threshold = args.threshold
+    if args.open_thinkness is None:
+        open_thinkness = eps/2
+    else:
+        open_thinkness = args.open_thinkness
+
+    # from mesh_geometry import *
     
     name = os.path.splitext(os.path.basename(args.mesh))[0]
-    field, remesh = grid_smaple_sdf(args.mesh,
-                                    resolution=args.resolution,
-                                    mode=args.mode,
-                                    out_dir=os.path.join(args.out_dir, name),
-                                    rescalar=args.rescalar,
-                                    open_thinkness=args.open_thinkness)
+
+    out_dir = os.path.join(out_dir, name)
+
+    trimesh_tem = trimesh.load(args.mesh)
+
+
+    device = torch.device(args.device)
+
+
+    mesh_tem = Meshes(verts=[torch.from_numpy(trimesh_tem.vertices).to(torch.float32)],
+                  faces=[torch.from_numpy(trimesh_tem.faces).to(torch.long)])
+
+    mesh_tem = mesh_tem.to(device)
+    # src_points_tensor,_,face_normals, points, normals, mesh= load_mesh_and_sample(filename_mesh,10_000_000,100_000)
+    # mesh_tem = load_objs_as_meshes([filename_mesh], device=device)
+    mesh_tem = normalize_mesh(mesh_tem, rescalar)
+
+    grid_voxel_coarse = torch.stack(
+        torch.meshgrid(
+            torch.linspace(-1+1/(resolution)/2, 1-1/(resolution)/2, resolution),
+            torch.linspace(-1+1/(resolution)/2, 1-1/(resolution)/2, resolution),
+            torch.linspace(-1+1/(resolution)/2, 1-1/(resolution)/2, resolution),
+            indexing='ij'
+        ), dim=-1
+    ).to('cpu').float()
+
+
+    udf_coarse = torch.zeros((resolution**3,)).to('cpu')
+
+
+    print('Querying UDF values...')
+
+    BVH = cubvh.cuBVH(mesh_tem.verts_packed(), mesh_tem.faces_packed()) # build with numpy.ndarray/torch.Tensor
+    max_query = 128**3
+    for i in tqdm(range(0, resolution**3, max_query)):
+        udf_coarse_tem, _, _ = BVH.unsigned_distance(grid_voxel_coarse.view(-1, 3)[i:i+max_query].to(device)
+                                                                , return_uvw=False)
+        udf_coarse[i:i+max_query] = udf_coarse_tem.cpu()
+        del udf_coarse_tem
+
+
+    udf_coarse = rearrange(udf_coarse, '(a b c) -> 1 a b c', a=resolution, 
+                        b=resolution, c=resolution)
+
+
+    active_threshold = 1/(resolution)/2*np.sqrt(3)
+
+    active_X, active_Y, active_Z = torch.where(udf_coarse[0] < active_threshold)
+
+    print('Flood filling...')
+
+    occ_floodmask = ~morphology.flood(udf_coarse[0].numpy()<active_threshold,
+                                    (0,0,0), connectivity=1)
+    occ_floodmask = torch.tensor(occ_floodmask).float().unsqueeze(0)
+
+    ## 
+    select_index = torch.where(udf_coarse.view(-1) < 4*eps)[0]
+
+    print('Computing refined occupancy...')
+
+
+    winding_occp = get_occp_from_mesh(mesh_tem, 
+                                    grid_voxel_coarse.view(-1, 3)[select_index,:].to(device),
+                                    open_thinkness=open_thinkness,
+                                    if_smooth=True, threshold=threshold)
+
+    winding_occp +=  (BVH.signed_distance(grid_voxel_coarse.view(-1, 3)[select_index,:].to(device),
+                                        return_uvw=False)[0] < eps).view(-1).float().to(device)*0.5
+
+    winding_occp = winding_occp/1.5
+
+
+    alpha = 1e2
+    winding_occp = torch.sigmoid(alpha*(winding_occp-0.99))/torch.sigmoid(torch.tensor(alpha*0.01))
+    winding_occp = torch.clamp(winding_occp, 0, 1)
+
+
+    occp_refine = occ_floodmask.view(-1)
+    occp_refine[select_index] = winding_occp.float().to('cpu')
+    occp_refine = rearrange(occp_refine, '(a b c) -> 1 a b c', a=resolution,
+                                b=resolution, c=resolution)
+
+
+
+
+    miu = resolution**2
+    # sdf_floodmask = sdf_coarse.abs() * (2*(0.5-occ_floodmask))
+    sdf_floodmask = (-miu*udf_coarse**2).exp() * (occp_refine).float() \
+        + (1 -(-miu*udf_coarse**2).exp()) * occ_floodmask.float()
+
+
+
+    sdf_floodmask = torch.tanh(2*(0.5-sdf_floodmask)*alpha)/np.tanh(alpha)
+
+    sdf_floodmask = sdf_floodmask * udf_coarse
+
+
+    del grid_voxel_coarse, winding_occp
+
+    if args.mode == 'sdf':
+        field = sdf_floodmask[0].cpu().numpy()
+    elif args.mode == 'occp':
+        field = occp_refine[0].cpu().numpy()
+
     
+    
+    if out_dir is not None:
+        if not os.path.exists(out_dir):
+            os.makedirs(out_dir)
+        
+    np.save(os.path.join(out_dir, name + '_' + mode + f'_{resolution}.npy'), field)
+    print('Field saved to', os.path.join(out_dir, name + '_' + mode + f'_{resolution}.npy'))
+
+
+    if args.if_remesh:
+
+        print('Marching cubes...')
+        vertices, faces, _, _ =  measure.marching_cubes(sdf_floodmask[0].numpy(), level=eps*2)
+        vertices = vertices/ (resolution-1) * (2 - 1/(resolution)) - 1 + 1/(resolution)/2
+
+        flood_mesh = Meshes(verts=[torch.from_numpy(vertices.copy()).to(torch.float32)], faces=[torch.from_numpy(faces.copy()).to(torch.long)])
+
+        mesh_plot = trimesh.Trimesh(vertices=flood_mesh.verts_packed().cpu().numpy(), 
+                                        faces=flood_mesh.faces_packed().cpu().numpy(), process=False)
+
+        print('The remeshed mesh is watertight: ', mesh_plot.is_watertight)
+
+        print('Smoothing the mesh...')
+        mesh_plot = trimesh.smoothing.filter_mut_dif_laplacian(mesh_plot, iterations=3)
+
+        print('%d vertices, %d faces in the remeshed mesh at resolution %d^3.' % (len(mesh_plot.vertices), len(mesh_plot.faces), resolution))
+        obj_path = os.path.join(out_dir, name + f'_{resolution}.obj')
+        mesh_plot.export(obj_path)
+        print('Re-mesh saved to', obj_path)
+
+        pl = pv.Plotter(notebook=False, off_screen=True)
+        pv_plot = pv.wrap(mesh_plot)
+        pv_plot['face_normals'] = (mesh_plot.vertex_normals + 1) / 2.
+        pl.add_mesh(pv_plot, opacity=1, scalars='face_normals', show_edges=0, rgb=True)
+        pl.screenshot(os.path.join(out_dir, name  + f'_{resolution}.png'))
+
+        print('Rendered image saved to', os.path.join(out_dir, name +f'_{resolution}.png'))
+
+
+
+
+
+
     
 
