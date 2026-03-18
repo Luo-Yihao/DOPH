@@ -530,7 +530,7 @@ class SolidAngleOccp(nn.Module):
                 b_vert = face_vect[:,:,:,1,:] # [B, N, F, 3]
                 c_vert = face_vect[:,:,:,2,:] # [B, N, F, 3]
 
-                face_det = (a_vert * b_vert.cross(c_vert)).sum(dim=-1) # [B, N, F]
+                face_det = (a_vert * b_vert.cross(c_vert, dim=-1)).sum(dim=-1) # [B, N, F]
 
                 abc = face_vect.norm(dim=-1).prod(dim=-1) # [B, N, F]
 
@@ -643,7 +643,7 @@ class SolidAngleOccp_components(nn.Module):
                 b_vert = face_vect[:,:,:,1,:] # [B, N, F, 3]
                 c_vert = face_vect[:,:,:,2,:] # [B, N, F, 3]
 
-                face_det = (a_vert * b_vert.cross(c_vert)).sum(dim=-1) # [B, N, F]
+                face_det = (a_vert * b_vert.cross(c_vert, dim=-1)).sum(dim=-1) # [B, N, F]
 
                 abc = face_vect.norm(dim=-1).prod(dim=-1) # [B, N, F]
 
